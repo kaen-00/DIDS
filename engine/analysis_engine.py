@@ -1,56 +1,83 @@
-### analysis_engine.py
 from flask import Flask, request, jsonify
-from trust_utils import update_trust_score, get_device_status
+import joblib
+import numpy as np
+from datetime import datetime
 import json
 import os
 
 app = Flask(__name__)
 
-ALERTS_FILE = "db/alerts.json"
-TRUST_THRESHOLD = 70
+model = joblib.load("intrusion_model.pkl")
+ALERT_LOG = "alerts.json"
+TRUST_DB = {}
 
-# Ensure alerts file exists
-os.makedirs("db", exist_ok=True)
-if not os.path.exists(ALERTS_FILE):
-    with open(ALERTS_FILE, "w") as f:
-        json.dump([], f)
+def log_alert(alert):
+    if not os.path.exists(ALERT_LOG):
+        with open(ALERT_LOG, "w") as f:
+            json.dump([], f)
 
-@app.route("/report", methods=["POST"])
-def receive_report():
-    data = request.get_json()
-    device = data.get("device")
-    trust_score = data.get("trust_score")
-    anomaly = data.get("anomaly")
+    with open(ALERT_LOG, "r") as f:
+        alerts = json.load(f)
 
-    # Update trust and get status
-    updated_score, status = update_trust_score(device, trust_score, anomaly)
+    alerts.append(alert)
 
-    response = {
-        "device": device,
-        "trust_score": updated_score,
-        "status": status
-    }
+    with open(ALERT_LOG, "w") as f:
+        json.dump(alerts, f, indent=2)
 
-    if status == "intrusion":
-        alert = {
-            "device": device,
-            "alert": "Intrusion detected",
-            "trust_score": updated_score,
-            "anomaly": anomaly
-        }
-        with open(ALERTS_FILE, "r+") as f:
-            alerts = json.load(f)
-            alerts.append(alert)
-            f.seek(0)
-            json.dump(alerts, f, indent=2)
+def update_trust(device_id, is_anomaly):
+    if device_id not in TRUST_DB:
+        TRUST_DB[device_id] = 1.0  # full trust
 
-        print(f"[ALERT] Intrusion detected from {device}, rerouting...")
+    if is_anomaly:
+        TRUST_DB[device_id] -= 0.1
+    else:
+        TRUST_DB[device_id] = min(TRUST_DB[device_id] + 0.01, 1.0)  # regain trust slowly
 
-    return jsonify(response)
+    TRUST_DB[device_id] = round(max(0.0, min(TRUST_DB[device_id], 1.0)), 2)
+    return TRUST_DB[device_id]
 
-@app.route("/health")
-def health_check():
-    return "Engine is running", 200
+@app.route("/evaluate", methods=["POST"])
+def evaluate():
+    data = request.json
+    device_id = data.get("device_id")
+    timestamp = data.get("timestamp")
+    features = data.get("features")
+
+    try:
+        # Convert features to model input
+        X = np.array([[
+            features["cpu_percent"],
+            features["ram_percent"],
+            features["disk_percent"],
+            features["net_io_sent"],
+            features["net_io_recv"],
+            features["suspicious_file_count"],
+            features["num_remote_ips"],
+            features["num_open_ports"]
+        ]])
+
+        prediction = model.predict(X)[0]  # -1 = anomaly, 1 = normal
+        is_anomaly = prediction == -1
+
+        trust = update_trust(device_id, is_anomaly)
+
+        if is_anomaly:
+            alert = {
+                "device_id": device_id,
+                "timestamp": timestamp,
+                "type": "Anomaly Detected",
+                "trust": trust,
+                "details": features
+            }
+            log_alert(alert)
+            print(f"🚨 Anomaly detected from {device_id} | Trust: {trust}")
+        else:
+            print(f"[{timestamp}] {device_id} normal | Trust: {trust}")
+
+        return jsonify({"anomaly": is_anomaly, "trust": trust}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
